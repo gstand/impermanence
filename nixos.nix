@@ -110,206 +110,24 @@ let
     user = "root";
     group = "root";
   };
-in
-{
-  options = {
-    environment.persistence = mkOption {
-      default = { };
-      type =
-        attrsOf (
-          submodule [
-            ({ name, config, ... }:
-              (importApply ./submodule-options.nix {
-                inherit pkgs lib name config;
-                user = "root";
-                group = "root";
-                homeDir = null;
-              }))
-            ({ name, config, ... }:
-              {
-                options = {
-                  users =
-                    let
-                      outerName = name;
-                      outerConfig = config;
-                    in
-                    mkOption {
-                      type = attrsOf (
-                        submodule (
-                          { name, config, ... }:
-                          importApply ./submodule-options.nix {
-                            inherit pkgs lib;
-                            config = outerConfig // config;
-                            name = outerName;
-                            usersOpts = true;
-                            user = name;
-                            group = users.${name}.group;
-                            homeDir = users.${name}.home;
-                          }
-                        )
-                      );
-                      default = { };
-                      description = ''
-                        A set of user submodules listing the files and
-                        directories to link to their respective user's
-                        home directories.
 
-                        Each attribute name should be the name of the
-                        user.
-
-                        For detailed usage, check the <link
-                        xlink:href="https://github.com/nix-community/impermanence">documentation</link>.
-                      '';
-                      example = literalExpression ''
-                        {
-                          talyz = {
-                            directories = [
-                              "Downloads"
-                              "Music"
-                              "Pictures"
-                              "Documents"
-                              "Videos"
-                              "VirtualBox VMs"
-                              { directory = ".gnupg"; mode = "0700"; }
-                              { directory = ".ssh"; mode = "0700"; }
-                              { directory = ".nixops"; mode = "0700"; }
-                              { directory = ".local/share/keyrings"; mode = "0700"; }
-                              ".local/share/direnv"
-                            ];
-                            files = [
-                              ".screenrc"
-                            ];
-                          };
-                        }
-                      '';
-                    };
-                };
-              })
-          ]
-        );
-      description = ''
-        A set of persistent storage location submodules listing the
-        files and directories to link to their respective persistent
-        storage location.
-
-        Each attribute name should be the full path to a persistent
-        storage location.
-
-        For detailed usage, check the <link
-        xlink:href="https://github.com/nix-community/impermanence">documentation</link>.
-      '';
-      example = literalExpression ''
-        {
-          "/persistent" = {
-            directories = [
-              "/var/log"
-              "/var/lib/bluetooth"
-              "/var/lib/nixos"
-              "/var/lib/systemd/coredump"
-              "/etc/NetworkManager/system-connections"
-              { directory = "/var/lib/colord"; user = "colord"; group = "colord"; mode = "u=rwx,g=rx,o="; }
-            ];
-            files = [
-              "/etc/machine-id"
-              { file = "/etc/nix/id_rsa"; parentDirectory = { mode = "u=rwx,g=,o="; }; }
-            ];
-          };
-          users.talyz = { ... }; # See the dedicated example
-        }
-      '';
+  # Create fileSystems bind mount entry.
+  mkBindMountNameValuePair = { dirPath, persistentStoragePath, hideMount, ... }: {
+    name = concatPaths [ "/" dirPath ];
+    value = {
+      device = concatPaths [ persistentStoragePath dirPath ];
+      noCheck = true;
+      options = [ "bind" "X-fstrim.notrim" ]
+        ++ optional hideMount "x-gvfs-hide";
+      depends = [ persistentStoragePath ];
     };
   };
 
-  config =
-    mkMerge [
-      (lib.optionalAttrs (options ? home-manager.sharedModules) {
-        home-manager.sharedModules = [
-          ./home-manager.nix
-          {
-            home._nixosModuleImported = true;
-          }
-        ];
-      })
-      (mkIf (allPersistentStoragePaths != { })
-        (mkMerge [
-          {
-            systemd.services =
-              let
-                mkPersistFileService = { filePath, persistentStoragePath, ... }@args:
-                  let
-                    targetFile = concatPaths [ persistentStoragePath filePath ];
-                    mountPoint = escapeShellArg filePath;
-                  in
-                  {
-                    "persist-${escapeSystemdPath targetFile}" = {
-                      description = "Bind mount or link ${targetFile} to ${mountPoint}";
-                      wantedBy = [ "local-fs.target" ];
-                      before = [ "local-fs.target" ];
-                      path = [ pkgs.util-linux ];
-                      unitConfig.DefaultDependencies = false;
-                      serviceConfig = {
-                        Type = "oneshot";
-                        RemainAfterExit = true;
-                        ExecStart = mkPersistFile args;
-                        ExecStop = pkgs.writeShellScript "unbindOrUnlink-${escapeSystemdPath targetFile}" ''
-                          set -eu
-                          if [[ -L ${mountPoint} ]]; then
-                              rm ${mountPoint}
-                          else
-                              umount ${mountPoint}
-                              rm ${mountPoint}
-                          fi
-                        '';
-                      };
-                    };
-                  };
-              in
-              foldl' recursiveUpdate { } (map mkPersistFileService files);
+  # Create all fileSystems bind mount entries for a specific
+  # persistent storage path.
+  bindMounts = listToAttrs (map mkBindMountNameValuePair directories);
 
-            boot.initrd.systemd.mounts =
-              let
-                mkBindMount = { dirPath, persistentStoragePath, hideMount, allowTrash, ... }: {
-                  wantedBy = [ "initrd.target" ];
-                  before = [ "initrd-nixos-activation.service" ];
-                  where = concatPaths [ "/sysroot" dirPath ];
-                  what = concatPaths [ "/sysroot" persistentStoragePath dirPath ];
-                  unitConfig.DefaultDependencies = false;
-                  type = "none";
-                  options = concatStringsSep "," ([
-                    "bind"
-                  ] ++ optionals hideMount [
-                    "x-gvfs-hide"
-                  ] ++ optionals allowTrash [
-                    "x-gvfs-trash"
-                  ]);
-                };
-                dirs = filter (d: elem d.dirPath pathsNeededForBoot) directories;
-              in
-              map mkBindMount dirs;
-
-            systemd.mounts =
-              let
-                mkBindMount = { dirPath, persistentStoragePath, hideMount, allowTrash, ... }: {
-                  wantedBy = [ "local-fs.target" ];
-                  before = [ "local-fs.target" ];
-                  where = concatPaths [ "/" dirPath ];
-                  what = concatPaths [ persistentStoragePath dirPath ];
-                  unitConfig.DefaultDependencies = false;
-                  type = "none";
-                  options = concatStringsSep "," ([
-                    "bind"
-                  ] ++ optionals hideMount [
-                    "x-gvfs-hide"
-                  ] ++ optionals allowTrash [
-                    "x-gvfs-trash"
-                  ]);
-                };
-              in
-              map mkBindMount directories;
-
-            system.activationScripts =
-              let
-                # Script to create directories in persistent and ephemeral
+  # Script to create directories in persistent and ephemeral
                 # storage. The directory structure's mode and ownership mirror
                 # those of persistentStoragePath/dir.
                 createDirectories = pkgs.runCommand "persistence-create-directories" { buildInputs = [ pkgs.bash ]; } ''
@@ -468,17 +286,269 @@ in
                     ${concatMapStrings mkPersistFile files}
                     exit $_status
                   '';
-              in
+
+  useSystemdActivation = (options.systemd ? sysusers && config.systemd.sysusers.enable) ||
+    (options.services ? userborn && config.services.userborn.enable);
+in
+{
+  options = {
+    environment.persistence = mkOption {
+      default = { };
+      type =
+        attrsOf (
+          submodule [
+            ({ name, config, ... }:
+              (importApply ./submodule-options.nix {
+                inherit pkgs lib name config;
+                user = "root";
+                group = "root";
+                homeDir = null;
+              }))
+            ({ name, config, ... }:
               {
-                "createPersistentStorageDirs" = {
-                  deps = [ "users" "groups" ];
-                  text = "${dirCreationScript}";
+                options = {
+                  users =
+                    let
+                      outerName = name;
+                      outerConfig = config;
+                    in
+                    mkOption {
+                      type = attrsOf (
+                        submodule (
+                          { name, config, ... }:
+                          importApply ./submodule-options.nix {
+                            inherit pkgs lib;
+                            config = outerConfig // config;
+                            name = outerName;
+                            usersOpts = true;
+                            user = name;
+                            group = users.${name}.group;
+                            homeDir = users.${name}.home;
+                          }
+                        )
+                      );
+                      default = { };
+                      description = ''
+                        A set of user submodules listing the files and
+                        directories to link to their respective user's
+                        home directories.
+
+                        Each attribute name should be the name of the
+                        user.
+
+                        For detailed usage, check the <link
+                        xlink:href="https://github.com/nix-community/impermanence">documentation</link>.
+                      '';
+                      example = literalExpression ''
+                        {
+                          talyz = {
+                            directories = [
+                              "Downloads"
+                              "Music"
+                              "Pictures"
+                              "Documents"
+                              "Videos"
+                              "VirtualBox VMs"
+                              { directory = ".gnupg"; mode = "0700"; }
+                              { directory = ".ssh"; mode = "0700"; }
+                              { directory = ".nixops"; mode = "0700"; }
+                              { directory = ".local/share/keyrings"; mode = "0700"; }
+                              ".local/share/direnv"
+                            ];
+                            files = [
+                              ".screenrc"
+                            ];
+                          };
+                        }
+                      '';
+                    };
                 };
-                "persist-files" = {
-                  deps = [ "createPersistentStorageDirs" ];
-                  text = "${persistFileScript}";
+              })
+          ]
+        );
+      description = ''
+        A set of persistent storage location submodules listing the
+        files and directories to link to their respective persistent
+        storage location.
+
+        Each attribute name should be the full path to a persistent
+        storage location.
+
+        For detailed usage, check the <link
+        xlink:href="https://github.com/nix-community/impermanence">documentation</link>.
+      '';
+      example = literalExpression ''
+        {
+          "/persistent" = {
+            directories = [
+              "/var/log"
+              "/var/lib/bluetooth"
+              "/var/lib/nixos"
+              "/var/lib/systemd/coredump"
+              "/etc/NetworkManager/system-connections"
+              { directory = "/var/lib/colord"; user = "colord"; group = "colord"; mode = "u=rwx,g=rx,o="; }
+            ];
+            files = [
+              "/etc/machine-id"
+              { file = "/etc/nix/id_rsa"; parentDirectory = { mode = "u=rwx,g=,o="; }; }
+            ];
+          };
+          users.talyz = { ... }; # See the dedicated example
+        }
+      '';
+    };
+  };
+
+  config =
+    mkMerge [
+      (lib.optionalAttrs (options ? home-manager.sharedModules) {
+        home-manager.sharedModules = [
+          ./home-manager.nix
+          {
+            home._nixosModuleImported = true;
+          }
+        ];
+      })
+      (mkIf (allPersistentStoragePaths != { })
+        (mkMerge [
+          {
+            systemd.services =
+              let
+                mkPersistFileService = { filePath, persistentStoragePath, ... }@args:
+                  let
+                    targetFile = concatPaths [ persistentStoragePath filePath ];
+                    mountPoint = escapeShellArg filePath;
+                  in
+                  {
+                    "persist-${escapeSystemdPath targetFile}" = {
+                      description = "Bind mount or link ${targetFile} to ${mountPoint}";
+                      wantedBy = [ "local-fs.target" ];
+                      before = [ "local-fs.target" ];
+                      path = [ pkgs.util-linux ];
+                      unitConfig.DefaultDependencies = false;
+                      serviceConfig = {
+                        Type = "oneshot";
+                        RemainAfterExit = true;
+                        ExecStart = mkPersistFile args;
+                        ExecStop = pkgs.writeShellScript "unbindOrUnlink-${escapeSystemdPath targetFile}" ''
+                          set -eu
+                          if [[ -L ${mountPoint} ]]; then
+                              rm ${mountPoint}
+                          else
+                              umount ${mountPoint}
+                              rm ${mountPoint}
+                          fi
+                        '';
+                      };
+                    };
+                  };
+              services = (map mkPersistFileService files) ++ lib.optional useSystemdActivation {
+          "persist-storage-dirs" = {
+            description = "Create persistent storage directories";
+            wantedBy = [ "sysinit.target" ];
+            after = [ "systemd-sysusers.service" ];
+            path = [ pkgs.util-linux ];
+            unitConfig.DefaultDependencies = false;
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = true;
+              ExecStart = dirCreationScript;
+            };
+          };
+          "persist-files" = {
+            description = "Persist files to persistent storage";
+            wantedBy = [ "sysinit.target" ];
+            after = [ "systemd-sysusers.service" "persist-storage-dirs.service" ];
+            path = [ pkgs.util-linux ];
+            unitConfig.DefaultDependencies = false;
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = true;
+              ExecStart = persistFileScript;
+            };
+          };
+        };
+      in
+      foldl' recursiveUpdate { } services;
+
+            boot.initrd.systemd.mounts =
+              let
+                mkBindMount = { dirPath, persistentStoragePath, hideMount, allowTrash, ... }: {
+                  wantedBy = [ "initrd.target" ];
+                  before = [ "initrd-nixos-activation.service" ];
+                  where = concatPaths [ "/sysroot" dirPath ];
+                  what = concatPaths [ "/sysroot" persistentStoragePath dirPath ];
+                  unitConfig.DefaultDependencies = false;
+                  type = "none";
+                  options = concatStringsSep "," ([
+                    "bind"
+                  ] ++ optionals hideMount [
+                    "x-gvfs-hide"
+                  ] ++ optionals allowTrash [
+                    "x-gvfs-trash"
+                  ]);
+                };
+                dirs = filter (d: elem d.dirPath pathsNeededForBoot) directories;
+              in
+              map mkBindMount dirs;
+
+            systemd.mounts =
+              let
+                mkBindMount = { dirPath, persistentStoragePath, hideMount, allowTrash, ... }: {
+                  wantedBy = [ "local-fs.target" ];
+                  before = [ "local-fs.target" ];
+                  where = concatPaths [ "/" dirPath ];
+                  what = concatPaths [ persistentStoragePath dirPath ];
+                  unitConfig.DefaultDependencies = false;
+                  type = "none";
+                  options = concatStringsSep "," ([
+                    "bind"
+                  ] ++ optionals hideMount [
+                    "x-gvfs-hide"
+                  ] ++ optionals allowTrash [
+                    "x-gvfs-trash"
+                  ]);
                 };
               };
+              services = (map mkPersistFileService files) ++ lib.optional useSystemdActivation {
+                "persist-storage-dirs" = {
+                  description = "Create persistent storage directories";
+                  wantedBy = [ "sysinit.target" ];
+                  after = [ "systemd-sysusers.service" ];
+                  path = [ pkgs.util-linux ];
+                  unitConfig.DefaultDependencies = false;
+                  serviceConfig = {
+                    Type = "oneshot";
+                    RemainAfterExit = true;
+                    ExecStart = dirCreationScript;
+                  };
+                };
+                "persist-files" = {
+                  description = "Persist files to persistent storage";
+                  wantedBy = [ "sysinit.target" ];
+                  after = [ "systemd-sysusers.service" "persist-storage-dirs.service" ];
+                  path = [ pkgs.util-linux ];
+                  unitConfig.DefaultDependencies = false;
+                  serviceConfig = {
+                    Type = "oneshot";
+                    RemainAfterExit = true;
+                    ExecStart = persistFileScript;
+                  };
+                };
+              };
+          in
+          foldl' recursiveUpdate { } services;
+
+          system.activationScripts = lib.mkIf (!useSystemdActivation) {
+              "createPersistentStorageDirs" = {
+                deps = [ "users" "groups" ];
+                text = "${dirCreationScript}";
+              };
+              "persist-files" = {
+                deps = [ "createPersistentStorageDirs" ];
+                text = "${persistFileScript}";
+             };
+            };
 
             boot.initrd.postMountCommands =
               let
