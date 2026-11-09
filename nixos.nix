@@ -593,7 +593,7 @@ in
                 } bind none
               '';
           in
-          mkIf (!config.boot.initrd.systemd.enable) (
+          mkIf (options.boot.initrd.systemd.enable.visible or true && !config.boot.initrd.systemd.enable) (
             mkAfter (concatMapStrings mkBindMount neededForBootDirs)
           );
       }
